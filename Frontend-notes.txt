@@ -1,0 +1,315 @@
+FRONTEND NOTES — Content Broadcasting System
+============================================
+Last updated: May 2026
+
+─────────────────────────────────────────────
+1. PROJECT STRUCTURE
+─────────────────────────────────────────────
+
+app/
+  (auth)/login/         → Login page. Route group keeps auth pages isolated
+                          from the dashboard shell without affecting the URL.
+  (dashboard)/          → All authenticated pages. The layout.jsx here wraps
+                          every child in DashboardLayout (sidebar + topbar).
+  live/[teacherId]/     → Public broadcast page. No auth, no layout wrapper.
+  layout.tsx            → Root layout: fonts, ThemeProvider, QueryProvider, Toaster.
+  page.tsx              → Redirects / → /login (middleware handles the reverse).
+
+src/
+  components/
+    common/   → Shared UI primitives: Navbar, Sidebar, PageHeader, EmptyState,
+                ErrorBoundary, SkeletonCard. No business logic here.
+    content/  → Content-domain components: ContentCard, ContentTable,
+                ContentPreview, StatusBadge, ScheduleBadge, FilePreview.
+    dashboard/→ StatsCard, StatsGrid. Isolated so they can be reused across
+                teacher and principal dashboards without coupling.
+    forms/    → LoginForm, UploadForm, RejectModal. Each form owns its own
+                RHF instance and Zod resolver. No form state leaks upward.
+    ui/       → shadcn/ui primitives only. Zero application logic.
+
+  context/
+    AuthContext.jsx → Thin React context wrapper around the Zustand store.
+                      Exists so components can use useContext(AuthContext) if
+                      preferred, and so the provider can be placed cleanly.
+
+  hooks/
+    useAuth.js          → Reads from Zustand. Hides store implementation detail.
+    useContent.js       → TanStack Query wrappers for content fetching/mutation.
+    useApproval.js      → TanStack Query wrappers for approval workflow.
+    useFileValidation.js→ Validates File objects against FILE_LIMITS. Returns
+                          { error, validate, clearError }.
+    useDebounce.js      → Delays a value update by N ms. Used for search inputs.
+
+  layouts/
+    DashboardLayout.jsx → Sidebar + topbar shell. Manages mobile sidebar state.
+    AuthLayout.jsx      → Centered card shell for login.
+
+  mocks/
+    db.js       → In-memory "database". Single source of truth for mock state.
+                  Seed data covers all statuses, varied schedules, 3 teachers.
+    handlers.js → Pure async functions simulating CRUD with 300–600ms delay.
+                  These ARE the mock API. Services call them in development.
+
+  providers/
+    QueryProvider.jsx → Wraps app with QueryClientProvider. Client component
+                        so the root layout stays a server component.
+
+  services/
+    api.js              → Axios instance with request/response interceptors.
+                          Not used in development (mock layer bypasses it).
+    auth.service.js     → login(), logout(), getProfile()
+    content.service.js  → uploadContent(), getMyContent(), getAllContent(), getLiveContent()
+    approval.service.js → getPendingContent(), approveContent(), rejectContent()
+
+  store/
+    authStore.js → Zustand store: { token, user, role, setAuth, clearAuth }.
+                   Persisted to localStorage via zustand/middleware persist.
+
+  utils/
+    constants.js    → ROLES, STATUS, SCHEDULE_STATUS, SUBJECTS, FILE_LIMITS,
+                      QUERY_KEYS, PAGINATION. No magic strings anywhere else.
+    formatters.js   → formatDate, formatFileSize, getStatusColor, getScheduleColor,
+                      capitalise. Pure functions, no side effects.
+    scheduleUtils.js→ isActive, isScheduled, isExpired, getScheduleStatus.
+                      Pure functions. Easily unit-testable.
+    validators.js   → Zod schemas: loginSchema, uploadSchema, rejectSchema.
+                      Also exports validateFile() for imperative file checks.
+
+middleware.js → Next.js Edge middleware for route protection (see §3).
+
+
+─────────────────────────────────────────────
+2. AUTHENTICATION FLOW
+─────────────────────────────────────────────
+
+Login:
+  1. User submits LoginForm (RHF + Zod validated).
+  2. auth.service.login() calls mockLogin() → returns { token, user }.
+  3. useAuth().setAuth() stores { token, user, role } in Zustand.
+     Zustand persist middleware writes this to localStorage under 'cbs-auth'.
+  4. LoginForm sets two lightweight cookies:
+       cbs-token=<token>   (for middleware to detect authentication)
+       cbs-role=<role>     (for middleware to enforce role-based routing)
+     These cookies carry no sensitive data — the token is a mock string,
+     and the role is just "teacher" or "principal".
+  5. Router.push() sends the user to their role-appropriate dashboard.
+
+Token injection (for real backend):
+  api.js request interceptor reads localStorage('cbs-auth').state.token
+  and attaches it as Authorization: Bearer <token> on every Axios request.
+  This avoids a circular import between api.js and the Zustand store.
+
+401 handling:
+  api.js response interceptor catches 401 responses, clears localStorage,
+  and redirects to /login. Components never need to handle auth expiry.
+
+Logout:
+  Sidebar calls auth.service.logout() (clears server session), then
+  clearAuth() (clears Zustand + localStorage), then clears the cookies,
+  then router.push('/login').
+
+
+─────────────────────────────────────────────
+3. ROLE-BASED ROUTING
+─────────────────────────────────────────────
+
+middleware.js runs on the Edge before every matched request.
+
+Matcher: ['/', '/login', '/dashboard/:path*']
+
+Rules:
+  - /dashboard/* without cbs-token cookie → redirect to /login
+  - /login or / with cbs-token → redirect to role's home dashboard
+  - /dashboard/teacher/* with role=principal → redirect to /dashboard/principal
+  - /dashboard/principal/* with role=teacher → redirect to /dashboard/teacher
+
+The middleware reads cbs-token and cbs-role cookies (set by LoginForm on
+the client). These are SameSite=Lax, not HttpOnly, because they're set
+from client-side JS. In a production system, the server would set an
+HttpOnly cookie and the middleware would validate it against the session store.
+
+Route groups (auth) and (dashboard) in the App Router are purely structural —
+they don't affect URLs. The actual protection is entirely in middleware.js.
+
+
+─────────────────────────────────────────────
+4. API INTEGRATION APPROACH — MOCK LAYER DESIGN
+─────────────────────────────────────────────
+
+The mock layer is designed for trivial replacement:
+
+  Development:
+    service.js → handlers.js → db.js (in-memory)
+
+  Production (one change per service file):
+    service.js → api.js (Axios) → real backend
+
+Each service function has a comment showing the exact Axios call to swap in:
+
+  // Production swap: return api.post('/auth/login', { email, password }).then(r => r.data)
+  return mockLogin({ email, password });
+
+The function signatures and return shapes are identical in both cases.
+No component or hook needs to change when switching to a real backend.
+
+Why not MSW (Mock Service Worker)?
+  MSW intercepts at the network layer and requires a service worker.
+  Our approach is simpler: the mock is just a function call. It's easier
+  to debug, works in all environments (including SSR), and makes the
+  "swap for real backend" path more explicit and auditable.
+
+db.js is the single source of truth for mock state. All mutations go
+through handlers.js, which reads/writes db.js. This mirrors how a real
+database would work and makes the mock layer realistic.
+
+
+─────────────────────────────────────────────
+5. STATE MANAGEMENT
+─────────────────────────────────────────────
+
+Three layers, each with a clear responsibility:
+
+Zustand (authStore.js):
+  Owns: token, user, role
+  Why: Auth state is client-only, needs to persist across page refreshes
+  (localStorage via persist middleware), and is read by many components.
+  Zustand is lighter than Context + useReducer and avoids re-render storms.
+
+TanStack Query (useContent.js, useApproval.js):
+  Owns: all server-derived data (content lists, pending items)
+  Why: Handles loading/error/stale states, caching, background refetch,
+  and cache invalidation automatically. Optimistic updates in useApproval
+  are clean with onMutate/onError/onSettled. Manual useState for server
+  data would require reimplementing all of this.
+
+Local useState:
+  Owns: ephemeral UI state — current page number, open dialog, search input,
+  selected file, sidebar open/closed.
+  Why: This state doesn't need to survive navigation or be shared. Lifting
+  it higher would add unnecessary complexity.
+
+Rule of thumb applied here:
+  "If it came from the server, it lives in TanStack Query.
+   If it's auth, it lives in Zustand.
+   If it's UI-only, it lives in useState."
+
+
+─────────────────────────────────────────────
+6. KEY ENGINEERING DECISIONS
+─────────────────────────────────────────────
+
+Client-side filtering (All Content page):
+  The filter/search on the principal's All Content page is done client-side
+  after fetching all content. Decision rationale: the dataset is bounded
+  (a school's content library, not millions of records), the data is already
+  cached by TanStack Query, and client-side filtering gives instant feedback
+  without a round-trip. If the dataset grew to tens of thousands of items,
+  the service interface already supports query params — just pass them through.
+
+Virtualization threshold (PAGINATION.VIRTUALIZE_THRESHOLD = 100):
+  react-window is only activated when the filtered list exceeds 100 items.
+  Below that, the DOM overhead of virtualization outweighs the benefit.
+  The threshold is a named constant so it's easy to tune.
+
+React.memo on leaf components:
+  ContentCard, StatsCard, StatusBadge, ScheduleBadge, ContentRow are all
+  memoized. These render in lists and their props rarely change independently,
+  so memoization prevents full-list re-renders when parent state changes
+  (e.g., opening a dialog).
+
+No prop drilling beyond 2 levels:
+  Auth state is accessed via useAuth() hook everywhere. Content data is
+  accessed via useContent()/useApproval() hooks. No prop chains.
+
+Error boundaries:
+  ErrorBoundary is a class component — the only one in the codebase.
+  React error boundaries cannot be function components. It's placed at the
+  layout level to catch render errors without crashing the whole app.
+
+next/image for all images:
+  Automatic WebP conversion, lazy loading, and proper sizing. The picsum.photos
+  domain is whitelisted in next.config.ts. Blob URLs (pre-upload previews)
+  use unoptimized={true} since next/image can't optimize local object URLs.
+
+
+─────────────────────────────────────────────
+7. ASSUMPTIONS
+─────────────────────────────────────────────
+
+- No real backend exists. All data is in-memory and resets on page refresh.
+- Mock credentials are hardcoded in db.js (teacher@school.com / teacher123,
+  principal@school.com / principal123).
+- File uploads don't actually store files. The mock returns a picsum.photos
+  URL as a stand-in for a CDN URL.
+- The "token" is a mock string, not a real JWT. It's stored in a cookie for
+  middleware access but has no cryptographic validity.
+- A single principal account manages all teachers' content.
+- Content items have a single file attachment (image only).
+
+
+─────────────────────────────────────────────
+8. KNOWN LIMITATIONS AND HOW TO EXTEND
+─────────────────────────────────────────────
+
+Real backend integration:
+  1. Set NEXT_PUBLIC_API_URL in .env.local
+  2. In each service file, replace the mock import with the commented-out
+     Axios call. That's the entire migration for each endpoint.
+  3. Update the auth flow to use HttpOnly cookies set by the server instead
+     of client-set cookies.
+
+Real file uploads:
+  Replace the fileUrl assignment in mockUploadContent with a multipart
+  form upload to a storage service (S3, Cloudinary, etc.). The service
+  interface (uploadContent(token, payload)) stays the same.
+
+Pagination (server-side):
+  Pass page/pageSize to getMyContent/getAllContent. The service interface
+  already accepts a token; add an options object as a second parameter.
+
+Multiple live items:
+  The live page currently shows the first active item. To show a carousel
+  or rotation, map over liveContent and use rotationDuration for timing.
+
+Real-time updates:
+  Replace the 30s polling interval with a WebSocket or SSE connection.
+  TanStack Query supports manual cache updates via queryClient.setQueryData,
+  so the component layer doesn't need to change.
+
+Testing:
+  scheduleUtils.js and formatters.js are pure functions — add unit tests
+  with Vitest. For component tests, use React Testing Library. For E2E,
+  Playwright works well with Next.js App Router.
+
+
+─────────────────────────────────────────────
+9. WHAT I WOULD DO WITH MORE TIME
+─────────────────────────────────────────────
+
+- WebSocket or SSE instead of polling on the live page. The current 30s
+  refetchInterval works but wastes a round-trip when nothing has changed.
+  A WebSocket connection would let the server push updates the moment a
+  principal approves content. TanStack Query supports this via
+  queryClient.setQueryData — the component layer wouldn't change at all.
+
+- Real JWT with refresh token rotation. The current mock token is a plain
+  string embedded with the userId. A production implementation would use
+  short-lived access tokens (15 min) and a rotating refresh token stored
+  in an HttpOnly cookie. The api.js response interceptor already handles
+  401s — it would just need to attempt a token refresh before redirecting
+  to login.
+
+- True DOM virtualisation for large lists. The All Content page currently
+  uses a CSS overflow scroll container when item count exceeds 100. This
+  keeps all DOM nodes mounted. react-window v1 (FixedSizeList) would
+  render only the visible rows, which matters at 1000+ items. The v2 API
+  changed significantly; given the time constraint the CSS approach was
+  the correct pragmatic call, but v1 or TanStack Virtual would be the
+  right long-term solution.
+
+- Server-side pagination and filtering. The current approach fetches all
+  content and filters client-side. This is fine for a school's content
+  library but wouldn't scale. The service interface is already designed
+  for this — getMyContent(token, { page, pageSize, status, search })
+  would be a non-breaking change, and TanStack Query's queryKey would
+  include the filter params to cache each page independently.
